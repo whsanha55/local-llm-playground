@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gemma-4 채팅</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<style>
+  :root { --bg:#f5f5f7; --me:#0a84ff; --fg:#1d1d1f; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif;
+         margin:0; background:var(--bg); color:var(--fg);
+         display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 16px;
+           background:#fff; border-bottom:1px solid #e5e5ea; }
+  header h1 { font-size:16px; margin:0; }
+  header .spacer { flex:1; }
+  select { border:1px solid #d2d2d7; border-radius:8px; padding:6px 8px;
+           font-size:13px; background:#fff; color:var(--fg); max-width:340px; }
+  button { cursor:pointer; border:none; border-radius:8px; padding:8px 14px; font-size:14px; }
+  #reset { background:#ffebe9; color:#d70015; }
+  main { flex:1; overflow-y:auto; }
+  .log { max-width:720px; margin:0 auto; padding:16px; display:flex;
+         flex-direction:column; gap:10px; }
+  .msg { max-width:86%; padding:10px 14px; border-radius:16px;
+         line-height:1.6; word-break:break-word; }
+  .user { align-self:flex-end; background:var(--me); color:#fff;
+          border-bottom-right-radius:4px; white-space:pre-wrap; }
+  .user a { color:#dbe9ff; word-break:break-all; }
+  .bot  { align-self:flex-start; background:#fff; border:1px solid #e5e5ea;
+          border-bottom-left-radius:4px; }
+  .pending { align-self:flex-start; color:#86868b; }
+  .error { align-self:flex-start; background:#ffebe9; color:#d70015; border:1px solid #ffd5d2; }
+
+  /* 봇 말풍선 안 마크다운 */
+  .bot > .body > :first-child { margin-top:0; }
+  .bot > .body > :last-child { margin-bottom:0; }
+  .bot .body p { margin:8px 0; }
+  .bot .body h1, .bot .body h2, .bot .body h3 { margin:14px 0 6px; font-size:1.05em; }
+  .bot .body ul, .bot .body ol { margin:8px 0; padding-left:22px; }
+  .bot .body li { margin:3px 0; }
+  .bot .body code { background:#f0f0f2; border-radius:4px; padding:1px 5px;
+                    font-size:.9em; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .bot .body pre { background:#1d1d1f; color:#f5f5f7; border-radius:10px;
+                   padding:12px 14px; overflow-x:auto; margin:10px 0; }
+  .bot .body pre code { background:none; color:inherit; padding:0; }
+  .bot .body table { border-collapse:collapse; margin:10px 0; font-size:.95em; }
+  .bot .body th, .bot .body td { border:1px solid #d2d2d7; padding:5px 10px; }
+  .bot .body blockquote { margin:8px 0; padding:2px 12px; border-left:3px solid #d2d2d7;
+                          color:#6e6e73; }
+  .bot .body a { color:var(--me); }
+  .bot .meta { font-size:11px; color:#86868b; margin-top:8px; text-align:right; }
+
+  .msg details { margin-top:6px; font-size:12px; color:#86868b; }
+  .msg details div { white-space:pre-wrap; border-left:2px solid #e5e5ea;
+                     padding-left:8px; margin-top:4px; max-height:200px; overflow-y:auto; }
+  footer { background:var(--bg); padding:10px 16px 14px; border-top:1px solid #e5e5ea; }
+  .inner { max-width:720px; margin:0 auto; }
+  .opts { font-size:13px; color:#86868b; margin-bottom:6px; }
+  .row { display:flex; gap:8px; align-items:flex-end; }
+  .row + .row { margin-top:8px; }
+  textarea, .row input { flex:1; min-width:0; resize:none; border:1px solid #d2d2d7;
+             border-radius:12px; padding:10px 12px; font:inherit; background:#fff; }
+  #send { background:var(--me); color:#fff; }
+  #summarize { background:#ff9f0a; color:#fff; }
+  #search { background:#30d158; color:#fff; }
+  button:disabled { opacity:.4; cursor:default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gemma-4 채팅</h1>
+  <span class="spacer"></span>
+  <select id="model" title="모델 선택"></select>
+  <button id="reset" title="대화 초기화">리셋</button>
+</header>
+<main><div class="log" id="log"></div></main>
+<footer>
+  <div class="inner">
+    <div class="opts"><label><input type="checkbox" id="think"> 추론 켜기</label></div>
+    <div class="row">
+      <textarea id="input" rows="1" placeholder="메시지를 입력하세요 (Enter 전송, Shift+Enter 줄바꿈)"></textarea>
+      <button id="send">전송</button>
+    </div>
+    <div class="row">
+      <input id="url" type="url" placeholder="https://… — URL 본문을 요약합니다" spellcheck="false">
+      <button id="summarize">요약</button>
+    </div>
+    <div class="row">
+      <input id="query" type="text" placeholder="검색어 — 웹 검색 후 답변합니다">
+      <button id="search">검색</button>
+    </div>
+  </div>
+</footer>
+<script>
+const log = document.getElementById('log');
+const input = document.getElementById('input');
+const send = document.getElementById('send');
+const think = document.getElementById('think');
+const modelSel = document.getElementById('model');
+const urlInput = document.getElementById('url');
+const summarizeBtn = document.getElementById('summarize');
+const queryInput = document.getElementById('query');
+const searchBtn = document.getElementById('search');
+const busyBtns = [send, summarizeBtn, searchBtn];
+const CLOSER = '<channel|>';
+const HAS_MD = typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined';
+let history = [];
+let session = 0;  // 리셋 시 증가 — 진행 중 요청의 결과는 폐기
+let busy = false;  // 채팅/요약/검색 중이면 true (버튼 3개 공유 잠금)
+
+if (!HAS_MD) console.warn('marked/DOMPurify 로드 실패 — 일반 텍스트로 표시됩니다');
+
+fetch('/models').then(r => r.json()).then(d => {
+  d.models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = m.label;
+    modelSel.appendChild(o);
+  });
+  modelSel.value = d.default;
+}).catch(() => {});
+
+// 모델 전환은 대화 주체가 바뀌므로 세션을 초기화한다
+modelSel.addEventListener('change', () => {
+  session++;
+  history = [];
+  log.innerHTML = '';
+  input.focus();
+});
+
+function renderMD(el, text) {
+  if (HAS_MD) el.innerHTML = DOMPurify.sanitize(marked.parse(text, { breaks: true }));
+  else el.textContent = text;
+}
+
+function scrollEnd() {
+  log.lastElementChild && log.lastElementChild.scrollIntoView({ block: 'end' });
+}
+
+// 봇 말풍선: (추론 접이식, 본문, 메타) 구성
+function botBubble() {
+  const div = document.createElement('div');
+  div.className = 'msg bot';
+  const details = document.createElement('details');
+  details.hidden = true;
+  const summary = document.createElement('summary');
+  summary.textContent = '추론 과정';
+  const rBody = document.createElement('div');
+  details.append(summary, rBody);
+  const body = document.createElement('div');
+  body.className = 'body';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  div.append(details, body, meta);
+  log.appendChild(div);
+  return { div, details, rBody, body, meta };
+}
+
+function bubble(cls, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.textContent = text;
+  log.appendChild(div);
+  scrollEnd();
+  return div;
+}
+
+// URL 사용자 말풍선 — 클릭 가능한 링크로
+function bubbleUserLink(url) {
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  const a = document.createElement('a');
+  a.href = url; a.textContent = url;
+  a.target = '_blank'; a.rel = 'noopener';
+  div.appendChild(a);
+  log.appendChild(div);
+  scrollEnd();
+}
+
+// 말풍선 b 에 스트리밍 토큰을 렌더링하는 onChunk — 채팅/요약/검색 공유.
+// <channel|> 로 추론/답변을 가르고, raw()/answer() 로 누적 원문을 내놓는다.
+function chunkSink(b) {
+  let raw = '';
+  let answerRaw = '';
+  let released = false;
+  const fn = t => {
+    raw += t;
+    if (!released) {
+      const i = raw.indexOf(CLOSER);
+      if (i >= 0) {
+        released = true;
+        const thought = raw.slice(0, i).replace('<|channel>thought', '').trim();
+        if (thought) { b.rBody.textContent = thought; b.details.hidden = false; }
+        answerRaw = raw.slice(i + CLOSER.length);
+        renderMD(b.body, answerRaw);
+      } else if (think.checked) {
+        // 추론 중 — thought 채널이 아직 열려 있음
+        b.rBody.textContent = raw.replace('<|channel>thought', '').trim();
+        b.details.hidden = false;
+      } else {
+        answerRaw = raw;
+        renderMD(b.body, raw);  // 채널 없이 바로 답하는 스트림
+      }
+    } else {
+      answerRaw = raw.slice(raw.indexOf(CLOSER) + CLOSER.length);
+      renderMD(b.body, answerRaw);
+    }
+    scrollEnd();
+  };
+  fn.raw = () => raw;
+  fn.answer = () => answerRaw;
+  return fn;
+}
+
+// NDJSON 스트림 읽기 — done 계측은 onDone 으로, {"error":...} 는 예외로
+async function readStream(res, onChunk, onDone) {
+  if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      const ev = JSON.parse(line);
+      if (ev.done) { onDone(ev); continue; }
+      if (ev.error) throw new Error(ev.error);
+      if (ev.t) onChunk(ev.t);
+      // ev.phase(fetch/search) 는 placeholder 로 이미 반영되어 있음
+    }
+  }
+}
+
+// 봇 측 공통 흐름: 말풍선 준비 → 스트리밍 → 히스토리 반영.
+// payload 는 이번 user 턴이 history 에 들어간 상태에서 호출부가 만들어 넘긴다.
+async function streamTurn(endpoint, payload, placeholder) {
+  busy = true;
+  busyBtns.forEach(x => x.disabled = true);
+  const mySession = session;
+  const b = botBubble();
+  b.body.textContent = placeholder;
+  const onChunk = chunkSink(b);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await readStream(res, onChunk, ev => {
+      if (ev.chunks > 0) {
+        b.meta.textContent =
+          `${Number(ev.seconds).toFixed(2)}s · ${(ev.chunks / ev.seconds).toFixed(1)} tok/s`;
+      }
+    });
+    if (mySession !== session) return;  // 대기 중 리셋됨 — 결과 폐기
+    if (b.body.textContent === placeholder) renderMD(b.body, onChunk.raw() || '(빈 응답)');
+    history.push({ role: 'assistant', content: b.body.textContent });
+  } catch (e) {
+    if (mySession !== session) return;
+    b.div.remove();
+    bubble('error', '오류: ' + e.message);
+    history.pop();  // 실패한 user 턴 제거
+  } finally {
+    busy = false;
+    busyBtns.forEach(x => x.disabled = false);
+    input.focus();
+  }
+}
+
+function genOpts() {
+  return { model: modelSel.value, enable_thinking: think.checked, max_tokens: 1024 };
+}
+
+function submit() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  input.value = '';
+  input.style.height = 'auto';
+  history.push({ role: 'user', content: text });
+  bubble('user', text);
+  streamTurn('/chat/stream', { messages: history, ...genOpts() }, '…');
+}
+
+function submitUrl() {
+  const url = urlInput.value.trim();
+  if (!url || busy) return;
+  if (!/^https?:\/\//i.test(url)) {
+    bubble('error', 'http(s):// 로 시작하는 URL을 넣어주세요');
+    return;
+  }
+  urlInput.value = '';
+  history.push({ role: 'user', content: '이 웹페이지를 요약해줘: ' + url });
+  bubbleUserLink(url);
+  streamTurn('/summarize/stream', { url, ...genOpts() }, '웹페이지 가져오는 중…');
+}
+
+function submitQuery() {
+  const q = queryInput.value.trim();
+  if (!q || busy) return;
+  queryInput.value = '';
+  history.push({ role: 'user', content: `'${q}'에 대해 웹에서 검색해서 알려줘` });
+  bubble('user', q);
+  streamTurn('/search/stream', { query: q, ...genOpts() }, '검색 중…');
+}
+
+send.onclick = submit;
+summarizeBtn.onclick = submitUrl;
+searchBtn.onclick = submitQuery;
+
+// 한줄 입력창(URL/검색) — Enter 로 즉시 실행
+function enterSend(el, fn) {
+  el.addEventListener('keydown', e => {
+    // 한글 IME 조합 중 Enter는 전송하지 않고 조합만 확정한다 (잔여 글자 방지)
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter') { e.preventDefault(); fn(); }
+  });
+}
+enterSend(urlInput, submitUrl);
+enterSend(queryInput, submitQuery);
+
+input.addEventListener('keydown', e => {
+  // 한글 IME 조합 중 Enter는 전송하지 않고 조합만 확정한다 (잔여 글자 방지)
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+});
+
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+});
+
+document.getElementById('reset').onclick = () => {
+  session++;
+  history = [];
+  log.innerHTML = '';
+  input.focus();
+};
+
+input.focus();
+</script>
+</body>
+</html>
