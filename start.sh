@@ -4,7 +4,7 @@
 # 이미 실행 중이면 강제로 끄고 다시 시작한다.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
-PY="$HOME/.local/share/uv/tools/mlx-lm/bin/python"
+PY="$HOME/.local/share/uv/tools/mlx-vlm/bin/python"
 PORT="${PORT:-8300}"
 
 [ -x "$PY" ] || { echo "mlx-lm 툴 파이썬이 없습니다: $PY" >&2; exit 1; }
@@ -38,5 +38,7 @@ export MODEL_ID
     sleep 1
   done ) &
 
+LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '아이피 확인 불가')"
 echo "기동 중 (기본 모델: $MODEL_ID) — http://127.0.0.1:$PORT/  (종료: Ctrl+C)"
-exec "$PY" -m uvicorn gemma4_api:app --host 127.0.0.1 --port "$PORT" --app-dir "$DIR"
+echo "같은 와이파이 기기 접속: http://$LAN_IP:$PORT/"
+exec "$PY" -m uvicorn gemma4_api:app --host 0.0.0.0 --port "$PORT" --app-dir "$DIR"

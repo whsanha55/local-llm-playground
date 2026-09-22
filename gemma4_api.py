@@ -16,7 +16,7 @@ API:
                            {"phase":"search"} 후 {"t":...}... {"done":...}
   GET  /                 — 채팅 웹페이지(마크다운·스트리밍·리셋·추론 토글·URL 요약·검색)
 
-실행: ~/.local/share/uv/tools/mlx-lm/bin/python -m uvicorn gemma4_api:app --port 8300
+실행: ~/.local/share/uv/tools/mlx-vlm/bin/python -m uvicorn gemma4_api:app --port 8300
 """
 import json
 import os
@@ -29,7 +29,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mlx_lm import load, generate, stream_generate
+from mlx_vlm import apply_chat_template, generate, load, stream_generate
 
 from websearch_mcp import McpError
 from websearch_mcp import client as mcp
@@ -113,11 +113,12 @@ SEARCH_PROMPT = (
 
 
 def build_prompt(req: ChatRequest):
-    tokenizer = get_model(req.model)[1]
-    return tokenizer.apply_chat_template(
+    model, processor = get_model(req.model)
+    return apply_chat_template(
+        processor,
+        model.config,
         [m.model_dump() for m in req.messages],
         add_generation_prompt=True,
-        tokenize=False,
         enable_thinking=req.enable_thinking,
     )
 
@@ -141,10 +142,10 @@ def health():
 @app.post("/chat")
 async def chat(req: ChatRequest):
     # MLX는 GPU 스트림이 스레드 종속이라 async(메인 스레드 실행)여야 한다.
-    model, tokenizer = get_model(req.model)
+    model, processor = get_model(req.model)
     prompt = build_prompt(req)
     t0 = time.time()
-    text = generate(model, tokenizer, prompt=prompt, max_tokens=req.max_tokens)
+    text = generate(model, processor, prompt=prompt, max_tokens=req.max_tokens).text
     seconds = round(time.time() - t0, 2)
 
     if CLOSER in text:
@@ -178,12 +179,12 @@ async def chat_stream(req: ChatRequest):
 
 async def gen_ndjson(req: ChatRequest):
     """생성 NDJSON 라인 제너레이터 — 채팅/요약/검색 엔드포인트가 공유."""
-    model, tokenizer = get_model(req.model)
+    model, processor = get_model(req.model)
     prompt = build_prompt(req)
     t0 = time.time()
     chunks = 0
     for resp in stream_generate(
-        model, tokenizer, prompt=prompt, max_tokens=req.max_tokens
+        model, processor, prompt=prompt, max_tokens=req.max_tokens
     ):
         if resp.text:
             chunks += 1
