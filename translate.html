@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gemma-4 번역</title>
+<style>
+  :root { --bg:#f5f5f7; --me:#bf5af2; --fg:#1d1d1f; --line:#e5e5ea; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif;
+         margin:0; background:var(--bg); color:var(--fg); min-height:100vh;
+         display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 16px;
+           background:#fff; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  header .spacer { flex:1; }
+  header a { color:#0a84ff; font-size:13px; text-decoration:none; }
+  main { flex:1; width:100%; max-width:860px; margin:0 auto; padding:16px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px;
+          padding:16px; margin-bottom:14px; }
+  .card h2 { font-size:14px; margin:0 0 12px; color:#86868b; font-weight:600; }
+  .row { display:flex; gap:8px; align-items:center; }
+  #file { flex:1; min-width:0; border:1px solid #d2d2d7; border-radius:12px;
+          padding:8px 12px; font:inherit; font-size:13px; background:#fff; color:#86868b; }
+  select { border:1px solid #d2d2d7; border-radius:8px; padding:6px 8px;
+           font-size:13px; background:#fff; color:var(--fg); max-width:260px; }
+  button, .act { cursor:pointer; border:none; border-radius:8px; padding:7px 13px;
+         font-size:13px; background:#f0f0f2; color:var(--fg); text-decoration:none; }
+  #submit { background:var(--me); color:#fff; }
+  button:disabled { opacity:.4; cursor:default; }
+  .summary { display:flex; gap:10px; margin-bottom:14px; }
+  .stat { flex:1; background:#fff; border:1px solid var(--line); border-radius:14px;
+          padding:12px 16px; text-align:center; }
+  .stat b { display:block; font-size:22px; }
+  .stat span { font-size:12px; color:#86868b; }
+  .job { display:flex; align-items:center; gap:12px; padding:10px 4px;
+         border-bottom:1px solid var(--line); }
+  .job:last-child { border-bottom:none; }
+  .job .name { flex:1; min-width:0; font-size:13px; white-space:nowrap;
+               overflow:hidden; text-overflow:ellipsis; }
+  .job .info { font-size:12px; color:#86868b; white-space:nowrap; }
+  .badge { font-size:11px; padding:3px 8px; border-radius:8px; white-space:nowrap; }
+  .st-queued    { background:#fff4d6; color:#b25000; }
+  .st-running   { background:#e8f0ff; color:#0a55c8; }
+  .st-done      { background:#e4f9e9; color:#1d7a35; }
+  .st-error     { background:#ffebe9; color:#d70015; }
+  .st-cancelled { background:#f0f0f2; color:#86868b; }
+  .bar { width:90px; height:5px; background:#f0f0f2; border-radius:3px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:#0a84ff; width:0; transition:width .5s; }
+  .acts { display:flex; gap:6px; }
+  #detail pre { white-space:pre-wrap; word-break:break-word; font:inherit;
+                font-size:13px; max-height:420px; overflow-y:auto;
+                background:var(--bg); border-radius:10px; padding:12px; margin:10px 0; }
+  #detail .meta { font-size:12px; color:#86868b; }
+  #detail a { color:#0a84ff; }
+  .empty { color:#86868b; font-size:13px; text-align:center; padding:20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gemma-4 파일 번역</h1>
+  <span class="spacer"></span>
+  <a href="/">← 채팅으로</a>
+</header>
+<main>
+  <div class="card">
+    <h2>업로드 (.srt / .txt → 한국어, SRT 구조 유지)</h2>
+    <div class="row">
+      <input id="file" type="file" accept=".srt,.txt">
+      <select id="model" title="모델 선택"></select>
+      <button id="submit">번역</button>
+    </div>
+  </div>
+
+  <div class="summary" id="summary"></div>
+
+  <div class="card">
+    <h2>작업 목록</h2>
+    <div id="jobs"><div class="empty">작업이 없습니다</div></div>
+  </div>
+
+  <div class="card" id="detail" hidden>
+    <h2 id="dtitle"></h2>
+    <div class="meta" id="dmeta"></div>
+    <pre id="dtext"></pre>
+    <div class="row"><a class="act" id="ddl" href="#">다운로드</a></div>
+  </div>
+</main>
+<script>
+const fileInput = document.getElementById('file');
+const submitBtn = document.getElementById('submit');
+const modelSel = document.getElementById('model');
+const jobsEl = document.getElementById('jobs');
+const summaryEl = document.getElementById('summary');
+const detailEl = document.getElementById('detail');
+const cancelClicked = new Set();  // 취소 버튼 누른 job — '취소 중…' 표시용
+
+fetch('/models').then(r => r.json()).then(d => {
+  d.models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = m.label;
+    modelSel.appendChild(o);
+  });
+  modelSel.value = d.default;
+}).catch(() => {});
+
+submitBtn.onclick = async () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  if (!/\.(srt|txt)$/i.test(f.name)) { alert('.srt / .txt 파일만 지원합니다'); return; }
+  submitBtn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('model', modelSel.value);
+    const res = await fetch('/translate', { method: 'POST', body: fd });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
+    fileInput.value = '';
+    render();  // 대기열에 즉시 반영
+  } catch (e) {
+    alert('오류: ' + e.message);
+  } finally {
+    submitBtn.disabled = false;
+  }
+};
+
+function badge(st) {
+  const label = cancelClicked.has(st.id) && st.state === 'running' ? '취소 중…' : st.state;
+  return `<span class="badge st-${st.state}">${label}</span>`;
+}
+
+function renderJobs(list) {
+  if (!list.length) {
+    jobsEl.innerHTML = '<div class="empty">작업이 없습니다</div>';
+    return;
+  }
+  jobsEl.innerHTML = '';
+  // 최근 작업이 위로
+  [...list].reverse().forEach(j => {
+    const row = document.createElement('div');
+    row.className = 'job';
+    const info = j.state === 'queued'
+      ? `앞에 ${j.wait_ahead}개 대기`
+      : j.state === 'running'
+        ? `${j.done_chunks}/${j.chunks} 청크 · ${j.seconds ?? 0}s`
+        : j.seconds != null ? `${j.seconds}s · ${j.chunks}청크` : '';
+    row.innerHTML = `
+      ${badge(j)}
+      <span class="name" title="${j.name}">${j.name}</span>
+      <span class="bar"><i style="width:${j.chunks ? (100 * j.done_chunks / j.chunks) : 0}%"></i></span>
+      <span class="info">${info}</span>
+      <span class="acts"></span>`;
+    const acts = row.querySelector('.acts');
+    if (j.state === 'done')
+      acts.appendChild(actBtn('조회', () => showDetail(j.id)));
+    if (j.state === 'queued' || j.state === 'running')
+      acts.appendChild(actBtn('취소', async () => {
+        cancelClicked.add(j.id);
+        await post(`/translate/jobs/${j.id}/cancel`).catch(() => {});
+      }));
+    acts.appendChild(actBtn('삭제', async () => {
+      await fetch('/translate/jobs/' + j.id, { method: 'DELETE' }).catch(() => {});
+      render();
+    }));
+    jobsEl.appendChild(row);
+  });
+}
+
+function actBtn(label, fn) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.onclick = fn;
+  return b;
+}
+
+function renderSummary(list) {
+  const count = s => list.filter(j => j.state === s).length;
+  summaryEl.innerHTML = ['queued:대기', 'running:진행', 'done:완료',
+                         'cancelled:취소', 'error:실패']
+    .map(p => { const [st, ko] = p.split(':');
+      return `<div class="stat"><b>${count(st)}</b><span>${ko}</span></div>`; })
+    .join('');
+}
+
+async function showDetail(id) {
+  const j = await post('/translate/jobs/' + id);
+  detailEl.hidden = false;
+  document.getElementById('dtitle').textContent = j.name;
+  const skipped = j.untranslated && j.untranslated.length
+    ? ` · 미번역 ${j.untranslated.length}` : '';
+  document.getElementById('dmeta').textContent =
+    `${j.state} · ${j.seconds}s · ${j.blocks}블록 · ${j.chunks}청크${skipped}`;
+  document.getElementById('dtext').textContent =
+    j.translation || j.error || '(결과 없음)';
+  const a = document.getElementById('ddl');
+  const dot = j.name.lastIndexOf('.');
+  a.href = URL.createObjectURL(
+    new Blob([j.translation || ''], { type: 'text/plain;charset=utf-8' }));
+  a.download = j.name.slice(0, dot) + '.ko' + j.name.slice(dot);
+  detailEl.scrollIntoView({ behavior: 'smooth' });
+}
+
+async function post(url) {
+  const r = await fetch(url);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.detail || 'HTTP ' + r.status);
+  return d;
+}
+
+async function render() {
+  try {
+    const d = await post('/translate/jobs');
+    renderJobs(d.jobs);
+    renderSummary(d.jobs);
+  } catch (e) { /* 폴링 오류는 무시 — 다음 틱에 재시도 */ }
+}
+
+render();
+setInterval(render, 1000);
+</script>
+</body>
+</html>

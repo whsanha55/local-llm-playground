@@ -62,9 +62,11 @@ PORT=9000 ./start.sh  # 포트 변경
 | `POST /summarize/stream` | URL 본문 추출 → 요약 스트리밍. `{"phase":"fetch"}` 후 토큰 스트리밍 |
 | `POST /search/stream` | 웹 검색 → 종합 답변 스트리밍. `{"phase":"search"}` 후 토큰 스트리밍 |
 | `POST /translate` | `.srt`/`.txt` 업로드 → 번역 작업 등록(202 `{job_id}`). 대기목록에 쌓여 순차 실행, 청크 병렬. SRT 구조 유지 |
+| `GET /translate` | 번역 전용 웹 UI(업로드·대시보드·작업 리스트·조회/취소/삭제) |
 | `GET /translate/jobs` | 번역 작업 목록(상태·진행률, 대기순번) |
 | `GET /translate/jobs/{id}` | 작업 상태 조회. 완료 시 번역 결과 포함 |
-| `DELETE /translate/jobs/{id}` | 작업 취소. 대기 중은 즉시, 실행 중은 청크 경계에서 정지 |
+| `POST /translate/jobs/{id}/cancel` | 작업 취소. 대기 중은 즉시, 실행 중은 청크 경계에서 정지 |
+| `DELETE /translate/jobs/{id}` | 작업 목록에서 제거(활성 작업은 취소 후 제거) |
 
 파일 번역 원본/결과는 `translations/<타임스탬프>_<원본명>` / `...<원본명>.ko.<확장자>`로 저장됩니다.
 

@@ -48,6 +48,7 @@ MODELS = {
 DEFAULT_MODEL = os.environ.get("MODEL_ID", "supergemma-abliterated")
 CLOSER = "<channel|>"
 UI_PATH = Path(__file__).with_name("gemma4_ui.html")
+TRANSLATE_UI_PATH = Path(__file__).with_name("translate.html")
 SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "20000"))
 SEARCH_MAX_CHARS = int(os.environ.get("SEARCH_MAX_CHARS", "4000"))  # 페이지당
 SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "4"))
@@ -400,7 +401,9 @@ async def translate_worker():
     """큐 소비 루프 — 번역 작업을 순차 실행(청크 병렬은 내부 유지)."""
     while True:
         payload = await translate_queue.get()
-        job = jobs[payload["job_id"]]
+        job = jobs.get(payload["job_id"])
+        if job is None:  # 대기 중 목록에서 삭제됨 — 폐기
+            continue
         if job.get("cancel"):  # 대기 중 취소 — 실행 없이 폐기
             job["state"] = "cancelled"
             continue
@@ -506,7 +509,7 @@ def translate_job(job_id: str):
     return job_view(jobs[job_id], with_translation=True)
 
 
-@app.delete("/translate/jobs/{job_id}")
+@app.post("/translate/jobs/{job_id}/cancel")
 def cancel_translate_job(job_id: str):
     """작업 취소. queued 는 즉시, running 은 청크 경계에서 정지(협력 취소)."""
     if job_id not in jobs:
@@ -518,6 +521,20 @@ def cancel_translate_job(job_id: str):
     if job["state"] == "queued":
         job["state"] = "cancelled"
     return job_view(job)
+
+
+@app.delete("/translate/jobs/{job_id}")
+def delete_translate_job(job_id: str):
+    """작업 목록에서 제거. 활성(queued/running) 작업이면 취소 후 제거."""
+    if job_id not in jobs:
+        raise HTTPException(404, "unknown job")
+    job = jobs[job_id]
+    if job["state"] in ("queued", "running"):
+        job["cancel"] = True
+        if job["state"] == "queued":
+            job["state"] = "cancelled"
+    del jobs[job_id]
+    return {"deleted": job_id}
 
 
 def _self_test():
@@ -553,6 +570,11 @@ def _self_test():
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(UI_PATH)
+
+
+@app.get("/translate", include_in_schema=False)
+def translate_page():
+    return FileResponse(TRANSLATE_UI_PATH)
 
 
 if __name__ == "__main__":
