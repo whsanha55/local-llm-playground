@@ -61,6 +61,7 @@ PORT=9000 ./start.sh  # 포트 변경
 | `POST /chat/stream` | NDJSON 스트리밍 `{"t": 토큰}... {"done": true, "seconds", "chunks"}` |
 | `POST /summarize/stream` | URL 본문 추출 → 요약 스트리밍. `{"phase":"fetch"}` 후 토큰 스트리밍 |
 | `POST /search/stream` | 웹 검색 → 종합 답변 스트리밍. `{"phase":"search"}` 후 토큰 스트리밍 |
+| `POST /translate` | `.srt`/`.txt` 파일 업로드 → 한국어 번역(완결 응답, 청크 병렬). SRT는 번호·타임스탬프 구조 유지 |
 
 ## 환경변수
 
@@ -71,6 +72,8 @@ PORT=9000 ./start.sh  # 포트 변경
 | `SUMMARY_MAX_CHARS` | `20000` | URL 요약 시 본문 최대 길이 |
 | `SEARCH_MAX_CHARS` | `4000` | 검색 시 페이지당 본문 최대 길이 |
 | `SEARCH_LIMIT` | `4` | 검색 결과 페이지 수 |
+| `TRANSLATE_CHUNK_CHARS` | `2000` | 파일 번역 청크 목표 글자수 |
+| `TRANSLATE_WORKERS` | `3` | 파일 번역 병렬 워커 수 |
 | `WEB_SEARCH_MCP_JS` | `./web-search-mcp/dist/index.js` | MCP 서버 진입점 경로 |
 | `WEB_SEARCH_MCP_TIMEOUT` | `120` | MCP 호출 타임아웃(초) |
 
