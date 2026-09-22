@@ -53,8 +53,9 @@ SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "20000"))
 SEARCH_MAX_CHARS = int(os.environ.get("SEARCH_MAX_CHARS", "4000"))  # 페이지당
 SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "4"))
 TRANSLATE_MAX_BYTES = int(os.environ.get("TRANSLATE_MAX_BYTES", "2000000"))
-TRANSLATE_CHUNK_CHARS = int(os.environ.get("TRANSLATE_CHUNK_CHARS", "2000"))  # 4000서 115블록 마커 드리프트로 하향
+TRANSLATE_CHUNK_BLOCKS = int(os.environ.get("TRANSLATE_CHUNK_BLOCKS", "50"))  # 청크 최대 블록 수
 TRANSLATE_WORKERS = int(os.environ.get("TRANSLATE_WORKERS", "3"))  # 병렬 효과는 Ollama의 OLLAMA_NUM_PARALLEL 설정을 따름
+GEN_RETRIES = int(os.environ.get("TRANSLATE_GEN_RETRIES", "3"))  # 생성 일시 실패·마커 드리프트 재시도 수
 TRANSLATE_DIR = Path(__file__).parent / "translations"
 
 class OllamaError(RuntimeError):
@@ -437,18 +438,9 @@ def parse_srt(text: str):
     return blocks if blocks and len(blocks) >= len(parts) * 0.5 else None
 
 
-def chunk_items(items, target=TRANSLATE_CHUNK_CHARS):
-    """[(번호, 한줄텍스트)] → 번호 경계에서만 분할한 청크 리스트."""
-    chunks, cur, size = [], [], 0
-    for item in items:
-        cur.append(item)
-        size += len(item[1])
-        if size >= target:
-            chunks.append(cur)
-            cur, size = [], 0
-    if cur:
-        chunks.append(cur)
-    return chunks
+def chunk_items(items, limit=TRANSLATE_CHUNK_BLOCKS):
+    """[(번호, 한줄텍스트)] → 최대 limit 블록 크기 청크 리스트."""
+    return [items[i:i + limit] for i in range(0, len(items), limit)]
 
 
 def translate_prompt(lines):
@@ -471,9 +463,21 @@ def parse_markers(text, expected):
 
 
 def _generate(model_id: str, text: str, max_tokens: int) -> str:
-    """워커 스레드용 생성 래퍼 — 추론 끄고 본문만 받는다."""
-    resp = chat_once(model_id, [{"role": "user", "content": text}], False, max_tokens)
-    return ((resp.get("message") or {}).get("content") or "").strip()
+    """워커 스레드용 생성 래퍼 — 추론 끄고 본문만 받는다.
+
+    일시 오류(연결 끊김·타임아웃·5xx)는 짧게 쉬었다가 재시도한다.
+    400/404는 재시도로 안 풀리는 요청 문제라 즉시 던진다.
+    """
+    for attempt in range(GEN_RETRIES):
+        try:
+            resp = chat_once(model_id, [{"role": "user", "content": text}], False, max_tokens)
+            return ((resp.get("message") or {}).get("content") or "").strip()
+        except (OllamaError, OSError) as e:
+            if isinstance(e, OllamaError) and e.status in (400, 404):
+                raise
+            if attempt == GEN_RETRIES - 1:
+                raise
+            time.sleep(1.5 ** attempt)
 
 
 def translate_all(model_id, chunks, on_progress=None, should_cancel=None):
@@ -481,8 +485,10 @@ def translate_all(model_id, chunks, on_progress=None, should_cancel=None):
 
     Ollama는 요청을 큐에 쌓아 처리하므로 실제 병렬도는 서버 설정
     (OLLAMA_NUM_PARALLEL)을 따른다 — 직렬이어도 동작에는 문제 없다.
-    마커 드리프트(모델이 긴 리스트에서 블록을 생략) 시 같은 크기 재시도는
-    무의미하므로 청크를 반분할해 재귀 재시도한다.
+    대청크 마커 드리프트(모델이 긴 리스트에서 블록을 생략) 시 같은 크기
+    재시도는 무의미하므로 반분할해 재귀 재시도한다. 8블록 이하 잎 청크는
+    같은 크기로 GEN_RETRIES 번 반복 재시도한 뒤 한 블록씩 개별 번역까지
+    폴백한다 — 원문 유지는 최후의 수단.
     on_progress(완료 청크 수)는 청크가 끝날 때마다, should_cancel()이 True면
     남은 청크를 건너뛴다(진행 중 청크는 마저 끝나고 정지 — 협력 취소).
     """
@@ -490,17 +496,27 @@ def translate_all(model_id, chunks, on_progress=None, should_cancel=None):
         if should_cancel and should_cancel():
             return {}, []
         prompt = translate_prompt(chunk)
-        max_tokens = min(4096, max(1024, sum(len(t) for _, t in chunk)))
+        max_tokens = min(8192, max(1024, sum(len(t) for _, t in chunk)))
+        if len(chunk) <= 8:  # 잎 청크 — 같은 크기 반복 재시도(반복검사)
+            for _ in range(GEN_RETRIES):
+                got = parse_markers(_generate(model_id, prompt, max_tokens), chunk)
+                if got is not None:
+                    return got, []
+            if len(chunk) > 1:  # 그래도 드리프트 — 한 블록씩 개별 번역
+                by, miss = {}, []
+                for item in chunk:
+                    g, m = work([item])
+                    by.update(g)
+                    miss.extend(m)
+                return by, miss
+            return dict(chunk), [no for no, _ in chunk]  # 최후: 원문 유지
         got = parse_markers(_generate(model_id, prompt, max_tokens), chunk)
         if got is not None:
             return got, []
-        if len(chunk) > 8:
-            mid = len(chunk) // 2
-            lg, lu = work(chunk[:mid])
-            rg, ru = work(chunk[mid:])
-            return {**lg, **rg}, lu + ru
-        # ponytail: 8블록 이하 재실패는 원문 유지 — 전체 500보다 낫다
-        return dict(chunk), [no for no, _ in chunk]
+        mid = len(chunk) // 2
+        lg, lu = work(chunk[:mid])
+        rg, ru = work(chunk[mid:])
+        return {**lg, **rg}, lu + ru
 
     by_no, untranslated, done = {}, [], 0
     with ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS) as pool:
@@ -672,8 +688,8 @@ def _self_test():
     assert parse_srt("그냥 텍스트\n두 줄") is None
 
     items = [(no, " ".join(b)) for no, _, b in blocks]
-    chunks = chunk_items(items, target=10)
-    # "Hello world"(11자)는 단독 청크, "Bye"+"End"는 묶여 2청크
+    chunks = chunk_items(items, limit=2)
+    # 최대 2블록 청크 → [1,2] + [3] 의 2청크
     assert len(chunks) == 2 and sum(len(c) for c in chunks) == 3, chunks
 
     got = parse_markers("[1] 안녕\n[2] 잘가\n[3] 끝", items)

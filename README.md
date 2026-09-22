@@ -102,8 +102,9 @@ python translate_client.py --server http://<Mac의 LAN IP>:8300 자막.srt
 | `SUMMARY_MAX_CHARS` | `20000` | URL 요약 시 본문 최대 길이 |
 | `SEARCH_MAX_CHARS` | `4000` | 검색 시 페이지당 본문 최대 길이 |
 | `SEARCH_LIMIT` | `4` | 검색 결과 페이지 수 |
-| `TRANSLATE_CHUNK_CHARS` | `2000` | 파일 번역 청크 목표 글자수 |
+| `TRANSLATE_CHUNK_BLOCKS` | `50` | 파일 번역 청크 최대 블록 수 |
 | `TRANSLATE_WORKERS` | `3` | 파일 번역 병렬 워커 수 (Ollama `OLLAMA_NUM_PARALLEL`에 따라 실병렬 결정) |
+| `TRANSLATE_GEN_RETRIES` | `3` | 생성 일시 실패·마커 드리프트 재시도 수 |
 | `WEB_SEARCH_MCP_JS` | `./web-search-mcp/dist/index.js` | MCP 서버 진입점 경로 |
 | `WEB_SEARCH_MCP_TIMEOUT` | `120` | MCP 호출 타임아웃(초) |
 
