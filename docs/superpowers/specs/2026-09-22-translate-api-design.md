@@ -12,34 +12,34 @@ gemma4_api.py(MLX 로컬 LLM 서버)에 파일 업로드 → 한국어 번역 �
 
 - 입력: `.srt`, `.txt` 파일 업로드 (multipart)
 - SRT는 블록 번호·타임스탬프 구조 100% 유지, 텍스트만 번역
-- 완결 동기 응답 (스트리밍 아님)
+- 비동기 작업 + 대기목록: 동시 요청은 큐에 쌓아 순차 실행, 진행률 조회 가능
+- 원본/번역 결과 파일을 `translations/` 폴더에 타임스탬프 파일명으로 저장
 - chunk 병렬 처리: 스레드 풀, 모델 1개 공유
-- 웹 UI(gemma4_ui.html)에 업로드/결과 기능 추가
+- 웹 UI(gemma4_ui.html)에 업로드/진행률/결과 기능 추가
 - 프롬프트는 범용 (특정 태그·형식에 대한 특수 지시 없음)
 
 ## API 명세
 
-`POST /translate` — multipart/form-data
+작업(job) 기반 비동기 — 요청은 즉시 `job_id` 반환, 서버 큐에서 순차 실행(청크 3병렬은 유지). 동시 요청은 대기목록에 쌓임.
 
-| 필드 | 설명 |
-|---|---|
-| `file` | .srt 또는 .txt |
+`POST /translate` — multipart/form-data (`file`, `model` 선택)
 
-응답:
+```json
+{ "job_id": "df1631fc01bd", "state": "queued", "chunks": 6 }
+```
+
+`GET /translate/jobs` — 목록 / `GET /translate/jobs/{id}` — 개별 상태(완료 시 `translation` 포함)
 
 ```json
 {
-  "translation": "번역된 전체 텍스트",
-  "blocks": 1405,
-  "chunks": 40,
-  "untranslated": [],
-  "seconds": 623.4,
-  "model": "supergemma-abliterated"
+  "id": "df1631fc01bd", "name": "movie.srt", "state": "running",
+  "blocks": 351, "chunks": 6, "done_chunks": 3, "seconds": 184.2
 }
 ```
 
-- 파일 2MB 초과 → 413
-- 지원 안 하는 확장자 → 400
+- `state`: `queued`(wait_ahead 대기순번 포함) → `running` → `done`/`error`
+- 파일 2MB 초과 → 413, 지원 안 하는 확장자 → 400 (등록 시점에 즉시)
+- 원본/결과 파일 저장: `translations/<타임스탬프>_<원본명>` / `...<stem>.ko<확장자>`
 
 ## SRT 파싱·청킹·재조립
 
@@ -66,12 +66,12 @@ gemma4_api.py(MLX 로컬 LLM 서버)에 파일 업로드 → 한국어 번역 �
 
 max_tokens: `min(4096, max(1024, 청크 글자수))`. enable_thinking=False 고정.
 
-## 병렬 처리
+## 병렬 처리·작업 큐
 
-- `ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS 환경변수, 기본 3)`
-- 각 워커: `build_prompt` → `generate()` (모델 가중치 공유, KV 캐시는 호출별 생성)
-- MLX는 GIL 해제 + 스레드별 Metal 스트림 → 청크 N 디코드 중 청크 N+1 프롬프트 평가 겹침 (실측 통상 1.3~1.6배)
-- **스파이크 테스트 선행**: 구현 첫 단계로 2스레드 동시 `generate()` 검증. 실패 판정 시 `max_workers=1` 폴백 (코드 경로 동일, 설정만 차이)
+- 작업은 서버 큐(asyncio.Queue + 단일 워커 루프)로 **한 번에 1개씩 순차 실행** — 동시 /translate 요청은 대기목록(`wait_ahead`)에 쌓임
+- 작업 내부는 `ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS 환경변수, 기본 3)`로 청크 병렬, `as_completed`로 완료 청크 수를 진행률에 반영
+- MLX는 GIL 해제 + 스레드별 Metal 스트림 → 청크 N 디코드 중 청크 N+1 프롬프트 평가 겹침 (스파이크 실측 1.43배)
+- 서버 재시작 시 대기·완료 작업 정보 소실(결과 파일은 디스크에 남음) — 로컬 도구라 만료 정리·영속화 없음
 
 ## 인코딩
 

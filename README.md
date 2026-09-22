@@ -61,7 +61,11 @@ PORT=9000 ./start.sh  # 포트 변경
 | `POST /chat/stream` | NDJSON 스트리밍 `{"t": 토큰}... {"done": true, "seconds", "chunks"}` |
 | `POST /summarize/stream` | URL 본문 추출 → 요약 스트리밍. `{"phase":"fetch"}` 후 토큰 스트리밍 |
 | `POST /search/stream` | 웹 검색 → 종합 답변 스트리밍. `{"phase":"search"}` 후 토큰 스트리밍 |
-| `POST /translate` | `.srt`/`.txt` 파일 업로드 → 한국어 번역(완결 응답, 청크 병렬). SRT는 번호·타임스탬프 구조 유지 |
+| `POST /translate` | `.srt`/`.txt` 업로드 → 번역 작업 등록(202 `{job_id}`). 대기목록에 쌓여 순차 실행, 청크 병렬. SRT 구조 유지 |
+| `GET /translate/jobs` | 번역 작업 목록(상태·진행률, 대기순번) |
+| `GET /translate/jobs/{id}` | 작업 상태 조회. 완료 시 번역 결과 포함 |
+
+파일 번역 원본/결과는 `translations/<타임스탬프>_<원본명>` / `...<원본명>.ko.<확장자>`로 저장됩니다.
 
 ## 환경변수
 

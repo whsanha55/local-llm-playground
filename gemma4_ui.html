@@ -325,7 +325,7 @@ send.onclick = submit;
 summarizeBtn.onclick = submitUrl;
 searchBtn.onclick = submitQuery;
 
-// 파일 번역 — 동기 완결 응답(수 분 소요)이라 경과 시간을 메타에 표시한다
+// 파일 번역 — 작업 등록 후 1초 폴링으로 진행상황(대기순번/청크) 표시
 async function submitFile() {
   const f = fileInput.files[0];
   if (!f || busy) return;
@@ -338,10 +338,6 @@ async function submitFile() {
   const b = botBubble();
   b.body.classList.add('plain');
   b.body.textContent = `${f.name} 번역 중…`;
-  const t0 = performance.now();
-  const tick = setInterval(() => {
-    b.meta.textContent = `번역 중… ${((performance.now() - t0) / 1000).toFixed(0)}s 경과`;
-  }, 1000);
   try {
     const fd = new FormData();
     fd.append('file', f);
@@ -349,21 +345,39 @@ async function submitFile() {
     const res = await fetch('/translate', { method: 'POST', body: fd });
     const d = await res.json();
     if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-    b.body.textContent = d.translation;
+
+    let job;
+    while (true) {
+      await new Promise(r => setTimeout(r, 1000));
+      const jr = await fetch('/translate/jobs/' + d.job_id);
+      job = await jr.json();
+      if (!jr.ok) throw new Error(job.detail || 'HTTP ' + jr.status);
+      if (job.state === 'queued') {
+        b.meta.textContent = `대기 중… (앞에 ${job.wait_ahead}개)`;
+      } else if (job.state === 'running') {
+        b.meta.textContent = `${job.done_chunks}/${job.chunks} 청크 · ${job.seconds}s`;
+      } else if (job.state === 'done') {
+        break;
+      } else {
+        throw new Error(job.error || job.state);
+      }
+    }
+    b.body.textContent = job.translation;
     const dot = f.name.lastIndexOf('.');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(
-      new Blob([d.translation], { type: 'text/plain;charset=utf-8' }));
+      new Blob([job.translation], { type: 'text/plain;charset=utf-8' }));
     a.download = f.name.slice(0, dot) + '.ko' + f.name.slice(dot);
     a.textContent = '다운로드';
-    b.meta.textContent = `${d.seconds}s · ${d.blocks}블록 · ${d.chunks}청크 · `;
+    const skipped = job.untranslated.length
+      ? ` · 미번역 ${job.untranslated.length}` : '';
+    b.meta.textContent = `${job.seconds}s · ${job.blocks}블록 · ${job.chunks}청크${skipped} · `;
     b.meta.appendChild(a);
     fileInput.value = '';
   } catch (e) {
     b.div.remove();
     bubble('error', '오류: ' + e.message);
   } finally {
-    clearInterval(tick);
     busy = false;
     busyBtns.forEach(x => x.disabled = false);
     input.focus();

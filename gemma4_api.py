@@ -24,10 +24,11 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -53,6 +54,7 @@ SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "4"))
 TRANSLATE_MAX_BYTES = int(os.environ.get("TRANSLATE_MAX_BYTES", "2000000"))
 TRANSLATE_CHUNK_CHARS = int(os.environ.get("TRANSLATE_CHUNK_CHARS", "2000"))  # 4000서 115블록 마커 드리프트로 하향
 TRANSLATE_WORKERS = int(os.environ.get("TRANSLATE_WORKERS", "3"))  # 스파이크 1.43x 확인
+TRANSLATE_DIR = Path(__file__).parent / "translations"
 
 state = {"models": {}}  # model_id -> (model, tokenizer)
 
@@ -68,9 +70,11 @@ def get_model(model_id: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_model(DEFAULT_MODEL)  # 기본 모델은 미리 로드
+    worker = asyncio.create_task(translate_worker())
     try:
         yield
     finally:
+        worker.cancel()
         await mcp.close()  # web-search-mcp 서브프로세스 정리
 
 
@@ -349,11 +353,12 @@ def _generate(model_id: str, text: str, max_tokens: int) -> str:
     return out.strip()
 
 
-def translate_all(model_id, chunks):
+def translate_all(model_id, chunks, on_progress=None):
     """ThreadPoolExecutor 로 청크 병렬 번역 → ({번호: 번역문}, [미번역 번호]).
 
     마커 드리프트(모델이 긴 리스트에서 블록을 생략) 시 같은 크기 재시도는
     무의미하므로 청크를 반분할해 재귀 재시도한다.
+    on_progress(완료 청크 수)는 청크가 끝날 때마다 호출된다.
     """
     def work(chunk):
         prompt = translate_prompt(chunk)
@@ -369,26 +374,78 @@ def translate_all(model_id, chunks):
         # ponytail: 8블록 이하 재실패는 원문 유지 — 전체 500보다 낫다
         return dict(chunk), [no for no, _ in chunk]
 
+    by_no, untranslated, done = {}, [], 0
     with ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS) as pool:
-        results = list(pool.map(work, chunks))
-    by_no, untranslated = {}, []
-    for got, missing in results:
-        by_no.update(got)
-        untranslated.extend(missing)
+        futs = [pool.submit(work, c) for c in chunks]
+        for fut in as_completed(futs):
+            got, missing = fut.result()
+            by_no.update(got)
+            untranslated.extend(missing)
+            done += 1
+            if on_progress:
+                on_progress(done)
     return by_no, untranslated
 
 
-@app.post("/translate")
+# --- 번역 작업 큐: 요청은 대기목록에 쌓고 한 번에 하나씩 실행 ---
+
+jobs = {}  # job_id -> 상태 dict (완료 결과 포함. 로컬 도구라 만료 정리 없음)
+translate_queue: asyncio.Queue = asyncio.Queue()
+
+
+async def translate_worker():
+    """큐 소비 루프 — 번역 작업을 순차 실행(청크 병렬은 내부 유지)."""
+    while True:
+        payload = await translate_queue.get()
+        job = jobs[payload["job_id"]]
+        job["state"], job["t0"] = "running", time.time()
+        try:
+            by_no, untranslated = await asyncio.get_running_loop().run_in_executor(
+                None, translate_all, payload["model"], payload["chunks"],
+                lambda n: job.update(done_chunks=n),
+            )
+            if payload["is_srt"]:
+                translation = "\n\n".join(
+                    f"{no}\n{ts}\n{by_no[no]}" for no, ts, _ in payload["blocks"]
+                )
+            else:
+                translation = "\n\n".join(by_no[no] for no, _ in payload["items"])
+            job["seconds"] = round(time.time() - job["t0"], 1)
+            out_path = TRANSLATE_DIR / (payload["stem"] + ".ko" + payload["ext"])
+            out_path.write_text(translation, encoding="utf-8")
+            job.update(state="done", translation=translation,
+                       untranslated=untranslated, out_file=out_path.name)
+        except Exception as e:  # 작업 하나 실패가 워커를 죽이지 않게
+            job.update(state="error", error=str(e))
+
+
+def job_view(job, with_translation=False):
+    """job dict → API 응답용 뷰. wait_ahead 는 대기 순번, seconds 는 진행 경과."""
+    view = {k: job[k] for k in
+            ("id", "name", "state", "blocks", "chunks", "done_chunks")}
+    view["seconds"] = (round(time.time() - job["t0"], 1)
+                       if job["state"] == "running" else job.get("seconds"))
+    if job["state"] == "queued":
+        ahead = [j["id"] for j in jobs.values() if j["state"] == "queued"]
+        view["wait_ahead"] = ahead.index(job["id"])
+    if with_translation:
+        for k in ("translation", "untranslated", "error", "out_file"):
+            if k in job:
+                view[k] = job[k]
+    return view
+
+
+@app.post("/translate", status_code=202)
 async def translate(
     file: UploadFile = File(...), model: str = Form(DEFAULT_MODEL)
 ):
-    """.srt/.txt 업로드 → 한국어 번역. SRT는 번호·타임스탬프 구조를 서버가 재조립해 유지."""
+    """.srt/.txt 업로드 → 번역 작업 등록(즉시 job_id 반환). SRT 구조는 서버가 유지."""
     data = await file.read()
     if len(data) > TRANSLATE_MAX_BYTES:
         raise HTTPException(413, "파일이 2MB 제한을 초과합니다")
-    name = (file.filename or "").lower()
+    orig = file.filename or "untitled.txt"
+    name = orig.lower()
     text = decode_upload(data)
-    t0 = time.time()
 
     if name.endswith(".srt"):
         blocks = parse_srt(text)
@@ -400,32 +457,43 @@ async def translate(
         paras = [p.strip().replace("\n", " ")
                  for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
         items = [(str(i), p) for i, p in enumerate(paras)]
-        is_srt = False
+        blocks, is_srt = None, False
     else:
         raise HTTPException(400, "지원하지 않는 형식입니다 (.srt/.txt)")
     if not items:
         raise HTTPException(400, "번역할 텍스트가 없습니다")
 
-    chunks = chunk_items(items)
-    by_no, untranslated = await asyncio.get_running_loop().run_in_executor(
-        None, translate_all, model, chunks
-    )
+    # 원본 저장: translations/<타임스탬프>_<원본명>, 결과는 .ko 확장자로 같은 폴더
+    TRANSLATE_DIR.mkdir(exist_ok=True)
+    stem, ext = os.path.splitext(orig)
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    in_path = TRANSLATE_DIR / f"{ts}_{stem}{ext}"
+    in_path.write_bytes(data)
 
-    if is_srt:
-        translation = "\n\n".join(
-            f"{no}\n{ts}\n{by_no[no]}" for no, ts, _ in blocks
-        )
-    else:
-        translation = "\n\n".join(by_no[no] for no, _ in items)
+    job_id = uuid4().hex[:12]
+    jobs[job_id] = {"id": job_id, "name": orig, "state": "queued",
+                    "blocks": len(items), "chunks": len(chunk_items(items)),
+                    "done_chunks": 0, "in_file": in_path.name}
+    await translate_queue.put({
+        "job_id": job_id, "model": model, "items": items, "blocks": blocks,
+        "is_srt": is_srt, "chunks": chunk_items(items),
+        "stem": f"{ts}_{stem}", "ext": ext,
+    })
+    return {"job_id": job_id, "state": "queued", "chunks": jobs[job_id]["chunks"]}
 
-    return {
-        "translation": translation,
-        "blocks": len(items),
-        "chunks": len(chunks),
-        "untranslated": untranslated,
-        "seconds": round(time.time() - t0, 1),
-        "model": model,
-    }
+
+@app.get("/translate/jobs")
+def translate_jobs():
+    """번역 작업 목록(결과 본문 제외)."""
+    return {"jobs": [job_view(j) for j in jobs.values()]}
+
+
+@app.get("/translate/jobs/{job_id}")
+def translate_job(job_id: str):
+    """개별 작업 상태. 완료 시 translation 포함."""
+    if job_id not in jobs:
+        raise HTTPException(404, "unknown job")
+    return job_view(jobs[job_id], with_translation=True)
 
 
 def _self_test():
