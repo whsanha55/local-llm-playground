@@ -70,6 +70,17 @@ PORT=9000 ./start.sh  # 포트 변경
 
 파일 번역 원본/결과는 `translations/<타임스탬프>_<원본명>` / `...<원본명>.ko.<확장자>`로 저장됩니다.
 
+### 원격(PC) 클라이언트
+
+다른 PC에서 폴링 방식으로 전송·수신(표준라이브러리만 사용, pip 불필요):
+
+```bash
+python translate_client.py --server http://<Mac의 LAN IP>:8300 자막.srt
+# 또는 GEMMA_SERVER=http://<Mac IP>:8300 설정 후 python translate_client.py 자막.srt
+```
+
+업로드 → 진행률 표시(5초 폴링) → 완료 시 `<이름>.ko.<확장자>` 저장.
+
 ## 환경변수
 
 | 변수 | 기본값 | 설명 |

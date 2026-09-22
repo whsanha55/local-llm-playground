@@ -93,6 +93,8 @@ gemma4_ui.html에 추가:
 - 스파이크: 병렬 generate 스레드 안전성 + 대략적 속도 배수 측정
 - 실제 검증: srt-sample/The_Odyssey.srt (1,405블록, 90KB)로 종단 테스트
 
-## 예상 소요
+## 원격 클라이언트 (폴링 방식 채택)
 
-Odyssey 샘플 기준 약 10~15분 (출력 약 2만 토큰, 로컬 e4b 추론). UI fetch는 타임아웃 없음, curl은 `--max-time` 필요.
+다른 PC(Windows 등)에서 웹훅/서버 없이 전송·수신: `translate_client.py`(표준라이브러리만).
+업로드 → 5초 폴링 진행 표시 → 완료 시 `<이름>.ko<확장자>` 저장.
+웹훅 콜백·SSE 방식은 검토했으나(Windows 측 수신 서버 필요 / 장기 연결 유지) 폴링으로 확정.
