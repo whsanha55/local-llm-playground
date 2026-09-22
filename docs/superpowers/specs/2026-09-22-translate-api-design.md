@@ -37,7 +37,8 @@ gemma4_api.py(MLX 로컬 LLM 서버)에 파일 업로드 → 한국어 번역 �
 }
 ```
 
-- `state`: `queued`(wait_ahead 대기순번 포함) → `running` → `done`/`error`
+- `state`: `queued`(wait_ahead 대기순번 포함) → `running` → `done`/`error`/`cancelled`
+- `DELETE /translate/jobs/{id}` 취소 — queued 는 즉시, running 은 협력 취소(진행 중 청크만 마저 끝내고 정지, 실측 최대 ~30초). 부분 결과는 폐기. 종료된 작업 취소 시 409
 - 파일 2MB 초과 → 413, 지원 안 하는 확장자 → 400 (등록 시점에 즉시)
 - 원본/결과 파일 저장: `translations/<타임스탬프>_<원본명>` / `...<stem>.ko<확장자>`
 

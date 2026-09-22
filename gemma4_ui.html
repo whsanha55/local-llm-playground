@@ -346,6 +346,19 @@ async function submitFile() {
     const d = await res.json();
     if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
 
+    // 진행 텍스트(span) + 취소 링크 — 폴링 갱신 시 링크가 지워지지 않게 분리
+    const mspan = document.createElement('span');
+    const cancelA = document.createElement('a');
+    cancelA.textContent = '취소';
+    cancelA.href = '#';
+    cancelA.onclick = async e => {
+      e.preventDefault();
+      cancelA.remove();
+      mspan.textContent = '취소 요청… (청크 경계에서 정지)';
+      await fetch('/translate/jobs/' + d.job_id, { method: 'DELETE' }).catch(() => {});
+    };
+    b.meta.append(mspan, ' · ', cancelA);
+
     let job;
     while (true) {
       await new Promise(r => setTimeout(r, 1000));
@@ -353,15 +366,20 @@ async function submitFile() {
       job = await jr.json();
       if (!jr.ok) throw new Error(job.detail || 'HTTP ' + jr.status);
       if (job.state === 'queued') {
-        b.meta.textContent = `대기 중… (앞에 ${job.wait_ahead}개)`;
+        mspan.textContent = `대기 중… (앞에 ${job.wait_ahead}개)`;
       } else if (job.state === 'running') {
-        b.meta.textContent = `${job.done_chunks}/${job.chunks} 청크 · ${job.seconds}s`;
-      } else if (job.state === 'done') {
-        break;
+        mspan.textContent = `${job.done_chunks}/${job.chunks} 청크 · ${job.seconds}s`;
       } else {
-        throw new Error(job.error || job.state);
+        break;  // done / cancelled / error
       }
     }
+    cancelA.remove();
+    if (job.state === 'cancelled') {
+      b.body.textContent = `${f.name} 번역 취소됨`;
+      b.meta.textContent = `취소 · ${job.done_chunks}/${job.chunks} 청크 완료 상태`;
+      return;
+    }
+    if (job.state !== 'done') throw new Error(job.error || job.state);
     b.body.textContent = job.translation;
     const dot = f.name.lastIndexOf('.');
     const a = document.createElement('a');

@@ -353,14 +353,17 @@ def _generate(model_id: str, text: str, max_tokens: int) -> str:
     return out.strip()
 
 
-def translate_all(model_id, chunks, on_progress=None):
+def translate_all(model_id, chunks, on_progress=None, should_cancel=None):
     """ThreadPoolExecutor 로 청크 병렬 번역 → ({번호: 번역문}, [미번역 번호]).
 
     마커 드리프트(모델이 긴 리스트에서 블록을 생략) 시 같은 크기 재시도는
     무의미하므로 청크를 반분할해 재귀 재시도한다.
-    on_progress(완료 청크 수)는 청크가 끝날 때마다 호출된다.
+    on_progress(완료 청크 수)는 청크가 끝날 때마다, should_cancel()이 True면
+    남은 청크를 건너뛴다(진행 중 청크는 마저 끝나고 정지 — 협력 취소).
     """
     def work(chunk):
+        if should_cancel and should_cancel():
+            return {}, []
         prompt = translate_prompt(chunk)
         max_tokens = min(4096, max(1024, sum(len(t) for _, t in chunk)))
         got = parse_markers(_generate(model_id, prompt, max_tokens), chunk)
@@ -398,12 +401,19 @@ async def translate_worker():
     while True:
         payload = await translate_queue.get()
         job = jobs[payload["job_id"]]
+        if job.get("cancel"):  # 대기 중 취소 — 실행 없이 폐기
+            job["state"] = "cancelled"
+            continue
         job["state"], job["t0"] = "running", time.time()
         try:
             by_no, untranslated = await asyncio.get_running_loop().run_in_executor(
                 None, translate_all, payload["model"], payload["chunks"],
                 lambda n: job.update(done_chunks=n),
+                lambda: job.get("cancel"),
             )
+            if job.get("cancel"):  # 실행 중 취소 — 청크 경계에서 정지, 결과 폐기
+                job.update(state="cancelled")
+                continue
             if payload["is_srt"]:
                 translation = "\n\n".join(
                     f"{no}\n{ts}\n{by_no[no]}" for no, ts, _ in payload["blocks"]
@@ -494,6 +504,20 @@ def translate_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "unknown job")
     return job_view(jobs[job_id], with_translation=True)
+
+
+@app.delete("/translate/jobs/{job_id}")
+def cancel_translate_job(job_id: str):
+    """작업 취소. queued 는 즉시, running 은 청크 경계에서 정지(협력 취소)."""
+    if job_id not in jobs:
+        raise HTTPException(404, "unknown job")
+    job = jobs[job_id]
+    if job["state"] not in ("queued", "running"):
+        raise HTTPException(409, f"이미 끝난 작업입니다 ({job['state']})")
+    job["cancel"] = True
+    if job["state"] == "queued":
+        job["state"] = "cancelled"
+    return job_view(job)
 
 
 def _self_test():
