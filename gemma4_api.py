@@ -1,13 +1,17 @@
-"""gemma-4 E4B 대화 API + 웹 UI.
+"""gemma-4 대화 API + 웹 UI — Ollama 백엔드(윈도우/맥 공용).
 
-모델: supergemma4-e4b-abliterated (HF 저장소 — 캐시에 있으면 그대로 로드).
-첫 요청 시 로딩(약 15초), 이후 캐시.
+모델: Ollama로 설치된 모델(기본 gemma4-srt:latest — SRT 번역 튜닝).
+추론은 Ollama 서버(http://127.0.0.1:11434, OLLAMA_HOST env로 변경)에 맡기고
+이 서버는 프롬프트 조립·스트리밍 브리지만 담당한다. 모델 목록은 설치된
+것에서 동적으로 읽는다. 추론 채널(message.thinking)은 스트림에 <channel|>
+마커를 끼워 구분해 기존 웹 UI의 분리 로직을 그대로 쓴다.
 
 웹 UI는 gemma4_ui.html 로 분리 — GET / 에서 매번 디스크에서 읽는다(수정 즉시 반영).
-웹 본문 추출·검색은 web-search-mcp(stdio MCP 서버, websearch_mcp.py 경유)를 사용.
+웹 본문 추출·검색은 web-search-mcp(stdio MCP 서버, websearch_mcp.py 경유)를 사용
+— node로 web-search-mcp 빌드가 있어야 한다(없으면 요약/검색만 오류 남).
 
 API:
-  GET  /models           — 선택 가능 모델 목록
+  GET  /models           — 선택 가능 모델 목록(설치된 Ollama 모델)
   POST /chat             — 완결 응답 {messages, model, enable_thinking, max_tokens}
   POST /chat/stream      — NDJSON 스트리밍 {"t":토큰}... {"done":true,"seconds","chunks"}
   POST /summarize/stream — URL 본문 추출 → 요약 스트리밍 {url,...}
@@ -17,13 +21,17 @@ API:
   POST /translate        — .srt/.txt 파일 업로드 → 한국어 번역(완결 응답, 청크 병렬)
   GET  /                 — 채팅 웹페이지(마크다운·스트리밍·리셋·추론 토글·URL 요약·검색·파일 번역)
 
-실행: ~/.local/share/uv/tools/mlx-vlm/bin/python -m uvicorn gemma4_api:app --port 8300
+실행: pip install -r requirements.txt
+      python -m uvicorn gemma4_api:app --port 8300   (또는 start.bat)
 """
 import asyncio
 import json
 import os
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,19 +42,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mlx_vlm import apply_chat_template, generate, load, stream_generate
-
 from websearch_mcp import McpError
 from websearch_mcp import client as mcp
 
-MODELS = {
-    "supergemma-abliterated": {
-        "label": "supergemma4-e4b-abliterated (수위 높음)",
-        "path": "Jiunsong/supergemma4-e4b-abliterated-mlx",
-    },
-}
-DEFAULT_MODEL = os.environ.get("MODEL_ID", "supergemma-abliterated")
-CLOSER = "<channel|>"
+DEFAULT_MODEL = os.environ.get("MODEL_ID", "gemma4-srt:latest")
+CLOSER = "<channel|>"  # 추론→답변 전환 마커 — 웹 UI가 이걸로 분리한다
 UI_PATH = Path(__file__).with_name("gemma4_ui.html")
 TRANSLATE_UI_PATH = Path(__file__).with_name("translate.html")
 SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "20000"))
@@ -54,23 +54,131 @@ SEARCH_MAX_CHARS = int(os.environ.get("SEARCH_MAX_CHARS", "4000"))  # 페이지�
 SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "4"))
 TRANSLATE_MAX_BYTES = int(os.environ.get("TRANSLATE_MAX_BYTES", "2000000"))
 TRANSLATE_CHUNK_CHARS = int(os.environ.get("TRANSLATE_CHUNK_CHARS", "2000"))  # 4000서 115블록 마커 드리프트로 하향
-TRANSLATE_WORKERS = int(os.environ.get("TRANSLATE_WORKERS", "3"))  # 스파이크 1.43x 확인
+TRANSLATE_WORKERS = int(os.environ.get("TRANSLATE_WORKERS", "3"))  # 병렬 효과는 Ollama의 OLLAMA_NUM_PARALLEL 설정을 따름
 TRANSLATE_DIR = Path(__file__).parent / "translations"
 
-state = {"models": {}}  # model_id -> (model, tokenizer)
+class OllamaError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 
-def get_model(model_id: str):
-    if model_id not in MODELS:
-        raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
-    if model_id not in state["models"]:
-        state["models"][model_id] = load(MODELS[model_id]["path"])
-    return state["models"][model_id]
+# ollama 파이썬 패키지 대신 REST를 직접 쓴다(버전에 따라 think 지원이 갈리므로).
+# 로컬 서비스라 시스템 프록시를 우회한다.
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+if "://" not in OLLAMA_URL:
+    OLLAMA_URL = "http://" + OLLAMA_URL  # "127.0.0.1:11434" 관례 지원
+READ_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))  # 청크 간 격리 타임아웃
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _request(path: str, payload=None, timeout=READ_TIMEOUT):
+    """Ollama REST 호출 → 파싱된 JSON. HTTP 오류는 OllamaError 로."""
+    if payload is None:
+        req = urllib.request.Request(OLLAMA_URL + path)
+    else:
+        req = urllib.request.Request(
+            OLLAMA_URL + path, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        try:
+            body = json.loads(body).get("error", body)
+        except json.JSONDecodeError:
+            pass
+        raise OllamaError(e.code, body) from None
+
+
+def _chat_payload(model_id, messages, think, max_tokens, stream):
+    return dict(model=model_id, messages=messages, think=think, stream=stream,
+                options={"num_predict": max_tokens})
+
+
+def _installed() -> List[str]:
+    """설치된 Ollama 모델명(name:tag) 목록."""
+    tags = _request("/api/tags", timeout=15)
+    return sorted(m.get("model") or m.get("name") or "" for m in tags.get("models", []))
+
+
+def ensure_model(model_id: str):
+    if model_id not in _installed():
+        raise HTTPException(404, f"설치되지 않은 모델: {model_id} — ollama pull {model_id}")
+
+
+def _unsupported_thinking(e) -> bool:
+    return "does not support thinking" in str(e)
+
+
+def chat_once(model_id, messages, think, max_tokens):
+    """완결 응답 — {message:{content,thinking},...} dict. 추론 미지원 모델에
+    think=True 면 끄고 재시도."""
+    try:
+        return _request("/api/chat", _chat_payload(model_id, messages, think, max_tokens, False))
+    except OllamaError as e:
+        if think and _unsupported_thinking(e):
+            return _request("/api/chat", _chat_payload(model_id, messages, False, max_tokens, False))
+        raise
+
+
+def stream_parts(model_id, messages, think, max_tokens):
+    """("think"|"text", 조각) NDJSON 스트리밍 — 동기 제너레이터(스레드에서 소비한다)."""
+    def _parts(think_flag):
+        req = urllib.request.Request(
+            OLLAMA_URL + "/api/chat",
+            data=json.dumps(_chat_payload(model_id, messages, think_flag, max_tokens, True)).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            r = _opener.open(req, timeout=READ_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            raise OllamaError(e.code, e.read().decode("utf-8", errors="replace")[:500]) from None
+        with r:
+            for line in r:
+                if not line.strip():
+                    continue
+                part = json.loads(line)
+                if part.get("error"):
+                    raise OllamaError(500, part["error"])
+                msg = part.get("message") or {}
+                if msg.get("thinking"):
+                    yield "think", msg["thinking"]
+                if msg.get("content"):
+                    yield "text", msg["content"]
+                if part.get("done"):
+                    return
+
+    try:
+        yield from _parts(think)
+    except OllamaError as e:  # 첫 토큰 전에만 난다 — 재시도 안전
+        if not (think and _unsupported_thinking(e)):
+            raise
+        yield from _parts(False)
+
+
+def _warmup():
+    """기동 검문 — Ollama 실행·기본 모델 설치 확인 후 모델을 메모리에 올린다."""
+    try:
+        names = _installed()
+    except Exception as e:
+        raise RuntimeError(
+            f"Ollama에 연결할 수 없습니다 — Ollama가 실행 중인지 확인: {e}"
+        ) from e
+    if DEFAULT_MODEL not in names:
+        raise RuntimeError(
+            f"모델이 설치되어 있지 않습니다: {DEFAULT_MODEL} — ollama pull {DEFAULT_MODEL}"
+        )
+    t0 = time.time()
+    chat_once(DEFAULT_MODEL, [{"role": "user", "content": "hi"}], False, 1)
+    print(f"{DEFAULT_MODEL} 로드 완료 ({time.time() - t0:.1f}s)")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_model(DEFAULT_MODEL)  # 기본 모델은 미리 로드
+    await asyncio.to_thread(_warmup)  # 기본 모델은 미리 로드
     worker = asyncio.create_task(translate_worker())
     try:
         yield
@@ -124,64 +232,55 @@ SEARCH_PROMPT = (
 )
 
 
-def build_prompt(req: ChatRequest):
-    model, processor = get_model(req.model)
-    return apply_chat_template(
-        processor,
-        model.config,
-        [m.model_dump() for m in req.messages],
-        add_generation_prompt=True,
-        enable_thinking=req.enable_thinking,
-    )
-
-
 @app.get("/models")
 def models():
+    names = _installed()
+    if DEFAULT_MODEL in names:  # 기본 모델을 맨 위로
+        names.remove(DEFAULT_MODEL)
+        names.insert(0, DEFAULT_MODEL)
     return {
         "default": DEFAULT_MODEL,
         "models": [
-            {"id": mid, "label": m["label"]} for mid, m in MODELS.items()
+            {"id": n, "label": n + (" (기본)" if n == DEFAULT_MODEL else "")}
+            for n in names
         ],
     }
 
 
 @app.get("/health")
 def health():
-    loaded = list(state["models"].keys())
-    return {"status": "ok", "default": DEFAULT_MODEL, "loaded": loaded}
+    return {"status": "ok", "default": DEFAULT_MODEL, "installed": len(_installed())}
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    # MLX는 GPU 스트림이 스레드 종속이라 async(메인 스레드 실행)여야 한다.
-    model, processor = get_model(req.model)
-    prompt = build_prompt(req)
+    ensure_model(req.model)
     t0 = time.time()
-    text = generate(model, processor, prompt=prompt, max_tokens=req.max_tokens).text
-    seconds = round(time.time() - t0, 2)
-
-    if CLOSER in text:
-        reasoning, answer = text.split(CLOSER, 1)
-        reasoning = reasoning.replace("<|channel>thought", "").strip()
-        answer = answer.strip()
-    else:
-        reasoning, answer = "", text.strip()
-
+    try:
+        resp = await asyncio.to_thread(
+            chat_once, req.model, [m.model_dump() for m in req.messages],
+            req.enable_thinking, req.max_tokens,
+        )
+    except OllamaError as e:
+        raise HTTPException(e.status or 500, str(e)) from e
+    msg = resp.get("message") or {}
+    reasoning = (msg.get("thinking") or "").strip()
+    answer = (msg.get("content") or "").strip()
     return {
         "answer": answer,
         "reasoning": reasoning,
         "model": req.model,
         "enable_thinking_param": req.enable_thinking,
         "model_thought": bool(reasoning),
-        "seconds": seconds,
+        "seconds": round(time.time() - t0, 2),
     }
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """NDJSON 스트리밍. MLX 생성은 메인 스레드(async 제너레이터 본문)에서 돌고,
-    yield 사이사이 청크가 flush 된다. 추론 채널은 그대로 흘려보내므로
-    클라이언트가 <channel|>로 분리한다."""
+    """NDJSON 스트리밍. Ollama 동기 스트림은 스레드에서 소비해 큐로 넘긴다.
+    추론 조각 뒤에는 <channel|> 마커를 끼워 넣으므로 클라이언트는
+    기존처럼 마커로 추론/답변을 분리한다."""
     return StreamingResponse(
         gen_ndjson(req),
         media_type="application/x-ndjson",
@@ -190,17 +289,48 @@ async def chat_stream(req: ChatRequest):
 
 
 async def gen_ndjson(req: ChatRequest):
-    """생성 NDJSON 라인 제너레이터 — 채팅/요약/검색 엔드포인트가 공유."""
-    model, processor = get_model(req.model)
-    prompt = build_prompt(req)
+    """생성 NDJSON 라인 제너레이터 — 채팅/요약/검색 엔드포인트가 공유.
+
+    동기 이터레이터를 이벤트 루프에서 바로 돌면 토큰 대기 중 다른 요청
+    (번역 작업 상태 폴링 등)이 굶으므로 생산은 스레드에 맡긴다.
+    """
+    ensure_model(req.model)
+    messages = [m.model_dump() for m in req.messages]
     t0 = time.time()
     chunks = 0
-    for resp in stream_generate(
-        model, processor, prompt=prompt, max_tokens=req.max_tokens
-    ):
-        if resp.text:
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    DONE = object()
+
+    def produce():
+        try:
+            for item in stream_parts(req.model, messages,
+                                     req.enable_thinking, req.max_tokens):
+                loop.call_soon_threadsafe(q.put_nowait, item)
+        except BaseException as e:  # 스레드 안 예외는 큐로 전달
+            loop.call_soon_threadsafe(q.put_nowait, e)
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, DONE)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    closed = False  # 추론→본문 전환 마커는 첫 본문 조각 앞에 한 번
+    while True:
+        item = await q.get()
+        if item is DONE:
+            break
+        if isinstance(item, BaseException):
+            yield json.dumps({"error": str(item)}, ensure_ascii=False) + "\n"
+            return
+        kind, text = item
+        if not text:
+            continue
+        if kind == "text" and not closed:
+            closed = True
             chunks += 1
-            yield json.dumps({"t": resp.text}, ensure_ascii=False) + "\n"
+            yield json.dumps({"t": CLOSER}, ensure_ascii=False) + "\n"
+        chunks += 1
+        yield json.dumps({"t": text}, ensure_ascii=False) + "\n"
     yield json.dumps(
         {"done": True, "seconds": round(time.time() - t0, 2), "chunks": chunks}
     ) + "\n"
@@ -341,22 +471,16 @@ def parse_markers(text, expected):
 
 
 def _generate(model_id: str, text: str, max_tokens: int) -> str:
-    """워커 스레드용 generate 래퍼 — 챗 템플릿 적용 후 생성, 추론 채널 분리."""
-    model, processor = get_model(model_id)
-    prompt = apply_chat_template(
-        processor, model.config,
-        [{"role": "user", "content": text}],
-        add_generation_prompt=True, enable_thinking=False,
-    )
-    out = generate(model, processor, prompt=prompt, max_tokens=max_tokens).text
-    if CLOSER in out:
-        out = out.split(CLOSER, 1)[1]
-    return out.strip()
+    """워커 스레드용 생성 래퍼 — 추론 끄고 본문만 받는다."""
+    resp = chat_once(model_id, [{"role": "user", "content": text}], False, max_tokens)
+    return ((resp.get("message") or {}).get("content") or "").strip()
 
 
 def translate_all(model_id, chunks, on_progress=None, should_cancel=None):
     """ThreadPoolExecutor 로 청크 병렬 번역 → ({번호: 번역문}, [미번역 번호]).
 
+    Ollama는 요청을 큐에 쌓아 처리하므로 실제 병렬도는 서버 설정
+    (OLLAMA_NUM_PARALLEL)을 따른다 — 직렬이어도 동작에는 문제 없다.
     마커 드리프트(모델이 긴 리스트에서 블록을 생략) 시 같은 크기 재시도는
     무의미하므로 청크를 반분할해 재귀 재시도한다.
     on_progress(완료 청크 수)는 청크가 끝날 때마다, should_cancel()이 True면
