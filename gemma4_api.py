@@ -453,11 +453,12 @@ def translate_prompt(lines):
 
 
 def parse_markers(text, expected):
-    """응답 → {번호: 번역문}. expected 의 번호가 하나라도 빠지면 None."""
+    """응답 → {번호: 번역문}. expected 의 번호가 하나라도 빠지거나
+    번역문이 비면 None(드리프트로 보고 재시도 경로로)."""
     got = {}
     for line in text.splitlines():
         m = MARKER_RE.match(line.strip())
-        if m:
+        if m and m.group(2).strip():
             got[m.group(1)] = m.group(2).strip()
     return got if all(no in got for no, _ in expected) else None
 
@@ -695,6 +696,7 @@ def _self_test():
     got = parse_markers("[1] 안녕\n[2] 잘가\n[3] 끝", items)
     assert got == {"1": "안녕", "2": "잘가", "3": "끝"}
     assert parse_markers("[1] 안녕\n[3] 끝", items) is None  # 2 누락
+    assert parse_markers("[1] 안녕\n[2]  \n[3] 끝", items) is None  # 빈 번역도 드리프트
 
     out = "\n\n".join(f"{no}\n{ts}\n{got[no]}" for no, ts, _ in blocks)
     assert out.count("-->") == 3 and "안녕" in out and "Hello" not in out
